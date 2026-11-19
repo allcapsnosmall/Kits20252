@@ -19,6 +19,7 @@ import {
   Pencil,
   Plus,
   Sparkles,
+  Star,
   Trash2,
   WandSparkles,
   X,
@@ -106,6 +107,7 @@ function App() {
       const conversation = await api.conversation(id);
       setActiveId(conversation.id);
       setMessages(conversation.messages ?? []);
+      setTone(conversation.tone ?? "professional");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not open this conversation.");
     }
@@ -173,6 +175,7 @@ function App() {
   const stopGeneration = () => {
     abortRef.current?.abort();
     setLoading(false);
+    if (activeId) void api.stopGeneration(activeId).catch(() => undefined);
   };
 
   const transformMessage = async (message: ChatMessage, action: string) => {
@@ -198,6 +201,16 @@ function App() {
     } catch {
       setError("Could not copy this message to the clipboard.");
     }
+  };
+
+  const toggleStar = async (conversation: Conversation) => {
+    try {
+      await api.starConversation(conversation.id, !conversation.isStarred);
+      await refreshConversations();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not update this conversation.");
+    }
+    setMenuId(null);
   };
 
   const renameConversation = async (conversation: Conversation) => {
@@ -286,6 +299,10 @@ function App() {
               </button>
               {menuId === conversation.id && (
                 <div className="conversation-menu">
+                  <button onClick={() => void toggleStar(conversation)}>
+                    <Star size={14} fill={conversation.isStarred ? "currentColor" : "none"} />
+                    {conversation.isStarred ? "Unstar" : "Star"}
+                  </button>
                   <button onClick={() => void renameConversation(conversation)}><Pencil size={14} /> Rename</button>
                   <button className="danger-action" onClick={() => void deleteConversation(conversation)}><Trash2 size={14} /> Delete</button>
                 </div>

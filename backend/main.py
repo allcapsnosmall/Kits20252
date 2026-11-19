@@ -6,6 +6,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
+from threading import Lock
 
 from bson import ObjectId
 from fastapi import FastAPI, HTTPException, Request
@@ -16,6 +17,9 @@ from pydantic import BaseModel, Field
 from pymongo import DESCENDING
 from pymongo.errors import PyMongoError
 from pymongo.asynchronous.mongo_client import AsyncMongoClient
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("chatzy")
@@ -30,6 +34,24 @@ TONE_INSTRUCTIONS: dict[Tone, str] = {
     "casual": "Use a warm, relaxed, conversational tone.",
     "concise": "Be concise and direct while still answering the question fully.",
 }
+
+ACTIVE_GENERATIONS: set[str] = set()
+GENERATION_LOCK = Lock()
+
+
+def cancel_generation(conversation_id: str) -> None:
+    with GENERATION_LOCK:
+        ACTIVE_GENERATIONS.add(conversation_id)
+
+
+def start_generation(conversation_id: str) -> None:
+    with GENERATION_LOCK:
+        ACTIVE_GENERATIONS.discard(conversation_id)
+
+
+def is_generation_cancelled(conversation_id: str) -> bool:
+    with GENERATION_LOCK:
+        return conversation_id in ACTIVE_GENERATIONS
 
 TRANSFORM_INSTRUCTIONS = {
     "simpler": "Rewrite the response so it is easier to understand, using plain language. Preserve the important facts.",
@@ -109,6 +131,7 @@ class ConversationCreate(BaseModel):
 
 class ConversationRename(BaseModel):
     title: str = Field(min_length=1, max_length=120)
+    tone: Tone | None = None
 
 
 class ChatRequest(BaseModel):
@@ -127,6 +150,10 @@ class PromptCreate(BaseModel):
     category: PromptCategory
 
 
+class ChatSendRequest(ChatRequest):
+    conversationId: str | None = None
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -140,6 +167,8 @@ def serialize_conversation(document: dict) -> dict:
         "id": str(document["_id"]),
         "title": document["title"],
         "updatedAt": isoformat(document["updatedAt"]),
+        "tone": document.get("tone", "professional"),
+        "isStarred": document.get("isStarred", False),
     }
 
 
@@ -149,6 +178,8 @@ def serialize_message(document: dict) -> dict:
         "role": document["role"],
         "content": document["content"],
         "createdAt": isoformat(document["createdAt"]),
+        "tone": document.get("tone"),
+        "status": document.get("status", "complete"),
     }
     if "transformation" in document:
         message["transformation"] = document["transformation"]
@@ -193,16 +224,19 @@ async def lifespan(app: FastAPI):
 
     mongo_uri = os.getenv("MONGODB_URI")
     if mongo_uri:
-        client = AsyncMongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        await client.admin.command("ping")
-        db = client[os.getenv("MONGODB_DATABASE", "chatzy_ai")]
-        await db.conversations.create_index([("updatedAt", DESCENDING)])
-        await db.messages.create_index(
-            [("conversationId", 1), ("createdAt", 1)]
-        )
-        await db.prompts.create_index([("createdAt", DESCENDING)])
-        app.state.mongo_client = client
-        app.state.db = db
+        try:
+            client = AsyncMongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+            await client.admin.command("ping")
+            db = client[os.getenv("MONGODB_DATABASE", "chatzy_ai")]
+            await db.conversations.create_index([("updatedAt", DESCENDING)])
+            await db.messages.create_index(
+                [("conversationId", 1), ("createdAt", 1)]
+            )
+            await db.prompts.create_index([("createdAt", DESCENDING)])
+            app.state.mongo_client = client
+            app.state.db = db
+        except PyMongoError as error:
+            logger.exception("MongoDB connection failed; starting in degraded mode")
 
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
@@ -232,6 +266,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+RATE_WINDOW_SECONDS = 60
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "120"))
+rate_requests: dict[str, list[float]] = {}
+rate_lock = Lock()
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    from time import monotonic
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = monotonic()
+    with rate_lock:
+        timestamps = [
+            timestamp
+            for timestamp in rate_requests.get(client_ip, [])
+            if now - timestamp < RATE_WINDOW_SECONDS
+        ]
+        if len(timestamps) >= RATE_LIMIT_REQUESTS:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Please try again shortly."},
+            )
+        timestamps.append(now)
+        rate_requests[client_ip] = timestamps
+    return await call_next(request)
 
 
 @app.get("/api/health")
@@ -268,6 +331,9 @@ async def create_conversation(body: ConversationCreate, request: Request):
         "title": body.title.strip() or "New chat",
         "createdAt": created,
         "updatedAt": created,
+        "tone": "professional",
+        "isStarred": False,
+        "messagesCount": 0,
     }
     result = await db.conversations.insert_one(document)
     document["_id"] = result.inserted_id
@@ -296,9 +362,12 @@ async def rename_conversation(
 ):
     db = database(request)
     object_id = parse_object_id(conversation_id, "Conversation")
+    updates = {"title": body.title.strip(), "updatedAt": now_utc()}
+    if body.tone is not None:
+        updates["tone"] = body.tone
     document = await db.conversations.find_one_and_update(
         {"_id": object_id},
-        {"$set": {"title": body.title.strip(), "updatedAt": now_utc()}},
+        {"$set": updates},
         return_document=True,
     )
     if document is None:
@@ -316,6 +385,20 @@ async def delete_conversation(conversation_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Conversation not found.")
     await db.messages.delete_many({"conversationId": object_id})
     return {"deleted": True}
+
+
+@app.patch("/api/conversations/{conversation_id}/star")
+async def toggle_star(conversation_id: str, request: Request, starred: bool = False):
+    db = database(request)
+    object_id = parse_object_id(conversation_id, "Conversation")
+    document = await db.conversations.find_one_and_update(
+        {"_id": object_id},
+        {"$set": {"isStarred": starred, "updatedAt": now_utc()}},
+        return_document=True,
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return serialize_conversation(document)
 
 
 def event_stream(event: dict) -> str:
@@ -342,6 +425,8 @@ async def stream_message(
         "role": "user",
         "content": user_content,
         "createdAt": created,
+        "tone": body.tone,
+        "status": "complete",
     }
     user_result = await db.messages.insert_one(user_document)
     user_document["_id"] = user_result.inserted_id
@@ -353,7 +438,10 @@ async def stream_message(
             title = f"{title.rstrip()}…"
     await db.conversations.update_one(
         {"_id": conversation_object_id},
-        {"$set": {"title": title, "updatedAt": created}},
+        {
+            "$set": {"title": title, "tone": body.tone, "updatedAt": created},
+            "$inc": {"messagesCount": 1},
+        },
     )
 
     history = await db.messages.find(
@@ -388,18 +476,26 @@ async def stream_message(
                     response_parts.append(token)
                     yield event_stream({"token": token})
 
+            if is_generation_cancelled(str(conversation_object_id)):
+                yield event_stream({"cancelled": True})
+                return
             content = "".join(response_parts)
             assistant_document = {
                 "conversationId": conversation_object_id,
                 "role": "assistant",
                 "content": content,
                 "createdAt": now_utc(),
+                "tone": body.tone,
+                "status": "complete",
             }
             result = await db.messages.insert_one(assistant_document)
             assistant_document["_id"] = result.inserted_id
             await db.conversations.update_one(
                 {"_id": conversation_object_id},
-                {"$set": {"updatedAt": assistant_document["createdAt"]}},
+                {
+                    "$set": {"updatedAt": assistant_document["createdAt"]},
+                    "$inc": {"messagesCount": 1},
+                },
             )
             yield event_stream(
                 {"done": True, "message": serialize_message(assistant_document)}
@@ -411,6 +507,9 @@ async def stream_message(
             )
             if isinstance(error, PyMongoError):
                 raise
+        finally:
+            with GENERATION_LOCK:
+                ACTIVE_GENERATIONS.discard(str(conversation_object_id))
 
     return StreamingResponse(
         generate(),
@@ -420,6 +519,99 @@ async def stream_message(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/api/chat/{conversation_id}/stop")
+async def stop_generation(conversation_id: str, request: Request):
+    database(request)
+    parse_object_id(conversation_id, "Conversation")
+    cancel_generation(conversation_id)
+    return {"cancelled": True}
+
+
+@app.post("/api/chat/send")
+async def send_chat(body: ChatSendRequest, request: Request):
+    db = database(request)
+    client = openai_client(request)
+    created = now_utc()
+
+    if body.conversationId:
+        conversation_id = parse_object_id(body.conversationId, "Conversation")
+        conversation = await db.conversations.find_one({"_id": conversation_id})
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+    else:
+        conversation = {
+            "title": "New chat",
+            "createdAt": created,
+            "updatedAt": created,
+            "tone": "professional",
+            "isStarred": False,
+            "messagesCount": 0,
+        }
+        result = await db.conversations.insert_one(conversation)
+        conversation_id = result.inserted_id
+
+    user_content = body.message.strip()
+    if not user_content:
+        raise HTTPException(status_code=422, detail="Message cannot be blank.")
+    user_document = {
+        "conversationId": conversation_id,
+        "role": "user",
+        "content": user_content,
+        "createdAt": created,
+        "tone": body.tone,
+        "status": "complete",
+    }
+    await db.messages.insert_one(user_document)
+
+    history = await db.messages.find({"conversationId": conversation_id}).sort(
+        "createdAt", DESCENDING
+    ).limit(40).to_list(length=40)
+    history.reverse()
+    model_messages = [{
+        "role": "system",
+        "content": f"You are CHATZY AI, a helpful, accurate assistant. {TONE_INSTRUCTIONS[body.tone]} Use Markdown for structure.",
+    }]
+    model_messages.extend({"role": item["role"], "content": item["content"]} for item in history)
+
+    try:
+        completion = await client.chat.completions.create(
+            model=model_name(),
+            messages=model_messages,
+        )
+    except OpenAIError as error:
+        logger.exception("Chat response failed")
+        raise HTTPException(status_code=502, detail="The response could not be generated.") from error
+
+    content = completion.choices[0].message.content
+    if not content:
+        raise HTTPException(status_code=502, detail="The AI returned an empty response.")
+    assistant_document = {
+        "conversationId": conversation_id,
+        "role": "assistant",
+        "content": content,
+        "createdAt": now_utc(),
+        "tone": body.tone,
+        "status": "complete",
+    }
+    result = await db.messages.insert_one(assistant_document)
+    assistant_document["_id"] = result.inserted_id
+    title = conversation["title"]
+    if title == "New chat":
+        title = user_content[:60].strip()
+        if len(user_content) > 60:
+            title += "…"
+    await db.conversations.update_one(
+        {"_id": conversation_id},
+        {
+            "$set": {"title": title, "tone": body.tone, "updatedAt": assistant_document["createdAt"]},
+            "$inc": {"messagesCount": 2},
+        },
+    )
+    response = serialize_conversation({**conversation, "_id": conversation_id, "title": title})
+    response["message"] = serialize_message(assistant_document)
+    return response
 
 
 @app.post("/api/conversations/{conversation_id}/transform")
@@ -525,6 +717,22 @@ async def save_prompt(body: PromptCreate, request: Request):
         "category": document["category"],
         "saved": True,
     }
+
+
+@app.get("/api/prompts/saved")
+async def list_saved_prompts(request: Request):
+    db = database(request)
+    documents = await db.prompts.find().sort("createdAt", DESCENDING).to_list(length=200)
+    return [
+        {
+            "id": str(document["_id"]),
+            "title": document["title"],
+            "prompt": document["prompt"],
+            "category": document["category"],
+            "saved": True,
+        }
+        for document in documents
+    ]
 
 
 @app.delete("/api/prompts/{prompt_id}")

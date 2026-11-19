@@ -16,6 +16,8 @@ export interface Conversation {
   title: string;
   updatedAt: string;
   messages?: ChatMessage[];
+  tone?: Tone;
+  isStarred?: boolean;
 }
 
 export interface LibraryPrompt {
@@ -58,6 +60,10 @@ export const api = {
     }),
   deleteConversation: (id: string) =>
     request<{ deleted: boolean }>(`/conversations/${id}`, { method: "DELETE" }),
+  starConversation: (id: string, isStarred: boolean) =>
+    request<Conversation>(`/conversations/${id}/star?starred=${isStarred}`, { method: "PATCH" }),
+  stopGeneration: (id: string) =>
+    request<{ cancelled: boolean }>(`/chat/${id}/stop`, { method: "POST" }),
   prompts: () => request<LibraryPrompt[]>("/prompts"),
   savePrompt: (prompt: Omit<LibraryPrompt, "id" | "saved">) =>
     request<LibraryPrompt>("/prompts", { method: "POST", body: JSON.stringify(prompt) }),
